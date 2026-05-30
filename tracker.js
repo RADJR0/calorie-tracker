@@ -1,0 +1,677 @@
+// ============================================================
+//  CALORIE TRACKER  --  for the Scriptable app (iOS)  v3
+//  No web host. Runs fully offline. Data saved on-device.
+//
+//  v3 changes:
+//   - Storage moved from Keychain to an on-device JSON file
+//     (more reliable; auto-migrates your old Keychain data).
+//   - Per-serving macros: enter servings + macros-per-serving,
+//     totals auto-calculate. Decimals allowed.
+//   - Saved common foods keep macros PER SERVING; selecting one
+//     asks how many servings, then adds the computed total.
+//   - Allows 0-calorie meals, fixes the "all macros hit" banner
+//     for 0 goals, handles midnight rollover, better save logging.
+//
+//  TO UPDATE: open your existing "Calorie Tracker" script in
+//  Scriptable, select all, delete, paste THIS in, tap Done.
+//  Your saved data carries over automatically.
+// ============================================================
+
+const STORE_KEY = "ct_store_v1";                 // legacy Keychain key (for migration)
+const fm = FileManager.local();
+const STORE_PATH = fm.joinPath(fm.documentsDirectory(), "calorie_tracker_store.json");
+
+// ---- read existing data: prefer the file, fall back to legacy Keychain ----
+let saved = null;
+try {
+  if (fm.fileExists(STORE_PATH)) {
+    saved = fm.readString(STORE_PATH);
+  } else if (Keychain.contains(STORE_KEY)) {
+    saved = Keychain.get(STORE_KEY);             // one-time migration source
+    console.log("Migrating store from Keychain to file.");
+  }
+} catch (e) { console.log("Reading store failed: " + e); }
+
+let initial = "null";
+if (saved) {
+  try { JSON.parse(saved); initial = saved.replace(/</g, "\\u003c"); }
+  catch (e) { console.log("Saved store was not valid JSON; starting fresh."); initial = "null"; }
+}
+
+const html = `
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<title>Calorie Tracker</title>
+<script>window.__INITIAL__ = ${initial};</script>
+<style>
+  :root{
+    --bg:#F4F3EE; --ink:#1C1B18; --card:#FCFBF8; --line:#E3DFD5; --sub:#6F6C66;
+    --faint:#9C988F; --stat:#F0EDE4; --inputline:#CFCABB; --coral:#D97757;
+    --coral-d:#C15F3C; --coral-dd:#A24E2F; --track:#E0DBCE; --chipA:#F6E8E1;
+    --over:#C0492E; --good:#4A7A55; --goodbg:#E8EFE6;
+  }
+  *{box-sizing:border-box; -webkit-tap-highlight-color:transparent;}
+  html,body{margin:0; padding:0;}
+  body{
+    background:var(--bg); color:var(--ink);
+    font-family: -apple-system, system-ui, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    -webkit-font-smoothing:antialiased; min-height:100vh;
+    padding: env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left);
+  }
+  .wrap{max-width:640px; margin:0 auto; padding:20px 16px 36px;}
+  .serif{font-family:Georgia,"Times New Roman",Times,serif;}
+  .sub{color:var(--sub);} .faint{color:var(--faint);}
+  .row{display:flex; align-items:center;}
+  .between{justify-content:space-between;}
+  .gap2{gap:8px;} .gap3{gap:12px;}
+  .mb3{margin-bottom:12px;} .mb4{margin-bottom:16px;} .mt5{margin-top:20px;}
+
+  .head{display:flex; align-items:center; justify-content:space-between; margin-bottom:16px;}
+  .brand{display:flex; align-items:center; gap:12px;}
+  .badge{width:38px; height:38px; border-radius:10px; background:var(--ink); display:flex; align-items:center; justify-content:center;}
+  .badge svg{width:20px; height:20px; color:var(--bg);}
+  h1{font-size:21px; font-weight:600; margin:0; letter-spacing:-0.01em; line-height:1.1;}
+  .date{font-size:12px;}
+
+  .card{background:var(--card); border:1px solid var(--line); border-radius:14px; padding:20px; margin-bottom:16px;}
+  .label{display:flex; align-items:center; gap:8px; font-size:14px; font-weight:500; color:var(--sub);}
+  .label svg{width:16px; height:16px;}
+
+  .big{font-size:38px; font-weight:700; letter-spacing:-0.02em; line-height:1;}
+  .big .of{font-size:18px; font-weight:500; color:var(--faint);}
+  .rem{font-size:30px; font-weight:700; line-height:1;}
+
+  .bar{height:10px; width:100%; background:var(--track); border-radius:999px; overflow:hidden;}
+  .bar > span{display:block; height:100%; border-radius:999px; background:var(--ink); width:0%; transition:width .3s ease;}
+  .bar.over > span{background:var(--coral);}
+
+  .stats{display:flex; gap:8px; margin-top:16px;}
+  .stat{background:var(--stat); border-radius:10px; padding:10px 12px; flex:1;}
+  .stat .v{font-size:16px; font-weight:700; margin-top:2px; line-height:1;}
+  .stat .v small{font-size:12px; font-weight:500; color:var(--faint);}
+  .stat .mini{height:6px; background:var(--track); border-radius:999px; overflow:hidden; margin-top:8px;}
+  .stat .mini > span{display:block; height:100%; background:var(--ink); border-radius:999px; width:0%; transition:width .3s ease;}
+  .stat .mini.good > span{background:var(--good);}
+
+  .winbanner{display:flex; align-items:center; justify-content:center; gap:8px; margin-top:12px; padding:11px; border-radius:10px; background:var(--goodbg); color:var(--good); font-size:13px; font-weight:600;}
+  .winbanner svg{width:16px; height:16px;}
+
+  input[type=text], input[type=number]{
+    width:100%; background:#fff; border:1px solid var(--inputline); color:var(--ink);
+    border-radius:10px; padding:10px 12px; font-size:16px; font-family:inherit; outline:none;
+  }
+  input::placeholder{color:#A8A49B;}
+  input:focus{border-color:var(--coral); box-shadow:0 0 0 3px rgba(217,119,87,.20);}
+  .fieldlabel{display:block; font-size:12px; color:var(--faint); margin-bottom:4px;}
+  .grid3{display:grid; grid-template-columns:1fr 1fr 1fr; gap:8px;}
+
+  button{font-family:inherit; cursor:pointer;}
+  .btn{background:var(--coral); color:#fff; border:none; border-radius:10px; padding:9px 16px; font-size:14px; font-weight:500; display:inline-flex; align-items:center; gap:6px;}
+  .btn:active{background:var(--coral-d);}
+  .btn svg{width:16px; height:16px;}
+  .ghost{background:none; border:none; color:#3A3833; font-size:14px; border-radius:10px; padding:9px 14px;}
+  .link{background:none; border:none; color:var(--coral-d); font-size:12px; font-weight:500; display:inline-flex; align-items:center; gap:4px; padding:0;}
+  .link svg{width:14px; height:14px;}
+  .reset{display:inline-flex; align-items:center; gap:6px; font-size:12px; color:var(--sub); background:none; border:1px solid var(--inputline); padding:7px 11px; border-radius:10px;}
+  .reset:active{background:#ECE9E1;}
+  .reset svg{width:14px; height:14px;}
+
+  .preview{font-size:14px; color:var(--sub);}
+  .preview b{color:var(--ink);}
+  .footer-row{display:flex; flex-direction:column; gap:12px;}
+  @media(min-width:520px){ .footer-row{flex-direction:row; align-items:center; justify-content:space-between;} }
+
+  .sectiontitle{font-size:12px; font-weight:500; color:var(--sub); text-transform:uppercase; letter-spacing:.04em;}
+  .chips{display:flex; flex-wrap:wrap; gap:8px;}
+  .chip{display:flex; align-items:center; gap:6px; padding:7px 8px 7px 12px; border-radius:999px; font-size:14px; background:var(--card); border:1px solid var(--inputline); color:#2A2825;}
+  .chip.active{border-color:var(--coral); background:var(--chipA); color:var(--coral-dd);}
+  .chip .cal{font-size:12px; color:var(--faint);}
+  .chip .del{background:none; border:none; color:#B6B2A7; display:flex; padding:0;}
+  .chip .del svg{width:14px; height:14px;}
+
+  ul.list{list-style:none; margin:8px 0 0; padding:0;}
+  ul.list li{display:flex; align-items:center; justify-content:space-between; padding:10px 0; border-top:1px solid #ECE9E1;}
+  ul.list li:first-child{border-top:none;}
+  .mname{font-size:14px;}
+  .mmac{font-size:12px; color:var(--faint); margin-top:2px;}
+  .mcal{font-size:14px; font-weight:600; white-space:nowrap;}
+  .iconbtn{background:none; border:none; color:#B6B2A7; display:flex; padding:0;}
+  .iconbtn svg{width:16px; height:16px;}
+  .empty{font-size:14px; color:var(--faint); text-align:center; padding:14px 0;}
+
+  .searchbox{position:relative; margin-bottom:12px;}
+  .searchbox svg{position:absolute; left:12px; top:50%; transform:translateY(-50%); width:16px; height:16px; color:var(--faint);}
+  .searchbox input{padding-left:36px;}
+  .scroll{max-height:260px; overflow-y:auto;}
+
+  .check{display:flex; align-items:center; gap:8px; margin-top:12px; font-size:12px; color:var(--sub);}
+  .check input{width:auto; accent-color:var(--coral);}
+
+  .hide{display:none !important;}
+  .note{font-size:12px; color:var(--faint); text-align:center; padding-bottom:8px;}
+  .addbtnsmall{background:none; border:none; color:var(--coral-d); font-size:12px; font-weight:500; display:inline-flex; align-items:center; gap:4px; padding:4px 8px; border-radius:8px;}
+  .addbtnsmall svg{width:14px; height:14px;}
+
+  .overlay{position:fixed; inset:0; background:rgba(28,27,24,0.45); display:flex; align-items:center; justify-content:center; padding:24px; z-index:50;}
+  .sheet{background:var(--card); border:1px solid var(--line); border-radius:14px; padding:20px; max-width:340px; width:100%;}
+  .sheet p{margin:0 0 18px; font-size:15px;}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <div class="head">
+    <div class="brand">
+      <div class="badge">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M8.5 14.5A2.5 2.5 0 0 0 11 12c0-1.38-.5-2-1-3-1.072-2.143-.224-4.054 2-6 .5 2.5 2 4.9 4 6.5 2 1.6 3 3.5 3 5.5a7 7 0 1 1-14 0c0-1.153.433-2.294 1-3a2.5 2.5 0 0 0 2.5 2.5z"/></svg>
+      </div>
+      <div>
+        <h1 class="serif">Calorie Tracker</h1>
+        <div class="date sub" id="date"></div>
+      </div>
+    </div>
+    <button class="reset" id="resetBtn">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="1 4 1 10 7 10"/><path d="M3.51 15a9 9 0 1 0 2.13-9.36L1 10"/></svg>
+      Reset today
+    </button>
+  </div>
+
+  <div class="card">
+    <div class="row between mb4">
+      <div class="label">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><circle cx="12" cy="12" r="6"/><circle cx="12" cy="12" r="2"/></svg>
+        <span id="goalLabel">Goal</span>
+      </div>
+      <button class="link" id="editGoalBtn">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17 3a2.85 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5z"/></svg>
+        Edit
+      </button>
+    </div>
+
+    <div id="goalDisplay" class="row between mb4" style="align-items:flex-end;">
+      <div>
+        <div class="big serif"><span id="consumed">0</span><span class="of"> / <span id="goalCal">0</span></span></div>
+        <div class="sub" style="font-size:12px; margin-top:4px;">calories consumed &middot; goal auto-calculated from macros</div>
+      </div>
+      <div style="text-align:right;">
+        <div class="rem serif" id="remaining">0</div>
+        <div class="sub" style="font-size:12px;" id="remLabel">remaining</div>
+      </div>
+    </div>
+
+    <div id="goalEdit" class="hide" style="margin-bottom:8px;">
+      <input type="text" id="gName" placeholder="Goal name (optional)" style="margin-bottom:12px;" />
+      <div class="grid3" style="margin-bottom:12px;">
+        <div><label class="fieldlabel">Protein (g)</label><input type="number" inputmode="decimal" id="gP" placeholder="0"/></div>
+        <div><label class="fieldlabel">Carbs (g)</label><input type="number" inputmode="decimal" id="gC" placeholder="0"/></div>
+        <div><label class="fieldlabel">Fat (g)</label><input type="number" inputmode="decimal" id="gF" placeholder="0"/></div>
+      </div>
+      <div class="footer-row">
+        <span class="preview">Calorie goal = <b id="goalPreview">0</b> cal</span>
+        <div class="row gap2">
+          <button class="btn" id="saveGoalBtn"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>Save</button>
+          <button class="ghost" id="cancelGoalBtn">Cancel</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="bar" id="calBar"><span></span></div>
+
+    <div class="stats">
+      <div class="stat"><div class="sub" style="font-size:12px;">Protein</div><div class="v"><span id="stP">0</span><small> / <span id="gpP">0</span>g</small></div><div class="mini" id="barP"><span></span></div></div>
+      <div class="stat"><div class="sub" style="font-size:12px;">Carbs</div><div class="v"><span id="stC">0</span><small> / <span id="gpC">0</span>g</small></div><div class="mini" id="barC"><span></span></div></div>
+      <div class="stat"><div class="sub" style="font-size:12px;">Fat</div><div class="v"><span id="stF">0</span><small> / <span id="gpF">0</span>g</small></div><div class="mini" id="barF"><span></span></div></div>
+    </div>
+
+    <div id="winBanner" class="winbanner hide">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>
+      All macro goals hit for today
+    </div>
+
+    <div class="mt5">
+      <div class="row between" style="margin-bottom:10px;">
+        <span class="sectiontitle">Preset goals</span>
+        <button class="link" id="newPresetBtn"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>New preset</button>
+      </div>
+      <div id="presetForm" class="hide" style="margin-bottom:12px;">
+        <input type="text" id="pName" placeholder="Preset name (e.g. Training day)" style="margin-bottom:8px;" />
+        <div class="grid3" style="margin-bottom:8px;">
+          <div><label class="fieldlabel">Protein (g)</label><input type="number" inputmode="decimal" id="pP" placeholder="0"/></div>
+          <div><label class="fieldlabel">Carbs (g)</label><input type="number" inputmode="decimal" id="pC" placeholder="0"/></div>
+          <div><label class="fieldlabel">Fat (g)</label><input type="number" inputmode="decimal" id="pF" placeholder="0"/></div>
+        </div>
+        <div class="footer-row">
+          <span class="preview">= <b id="presetPreview">0</b> cal</span>
+          <button class="btn" id="savePresetBtn"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>Save preset</button>
+        </div>
+      </div>
+      <div id="presetChips"></div>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="label mb3">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 2v7c0 1.1.9 2 2 2a2 2 0 0 0 2-2V2"/><path d="M7 2v20"/><path d="M21 15V2a5 5 0 0 0-5 5v6c0 1.1.9 2 2 2h3zm0 0v7"/></svg>
+      <span>Add a meal</span>
+    </div>
+    <input type="text" id="mName" placeholder="What did you eat?" style="margin-bottom:12px;" />
+    <div style="margin-bottom:12px;">
+      <label class="fieldlabel">Servings</label>
+      <input type="number" inputmode="decimal" id="mServ" placeholder="1" value="1"/>
+    </div>
+    <label class="fieldlabel" style="margin-bottom:6px;">Macros per serving</label>
+    <div class="grid3 mb3">
+      <div><label class="fieldlabel">Protein (g)</label><input type="number" inputmode="decimal" id="mP" placeholder="0"/></div>
+      <div><label class="fieldlabel">Carbs (g)</label><input type="number" inputmode="decimal" id="mC" placeholder="0"/></div>
+      <div><label class="fieldlabel">Fat (g)</label><input type="number" inputmode="decimal" id="mF" placeholder="0"/></div>
+    </div>
+    <div class="row between">
+      <span class="preview">Total: <b id="mealPreview">0</b> cal<span id="mealBreakdown" class="faint"></span></span>
+      <button class="btn" id="addMealBtn"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>Add meal</button>
+    </div>
+    <label class="check"><input type="checkbox" id="saveFood" /> Save to my common foods (keeps macros per serving)</label>
+  </div>
+
+  <div class="card">
+    <span class="label" style="display:inline-flex;">Today's meals (<span id="mealCount">0</span>)</span>
+    <ul class="list" id="mealList"></ul>
+  </div>
+
+  <div class="card">
+    <button id="toggleFoods" style="background:none;border:none;width:100%;display:flex;align-items:center;justify-content:space-between;padding:0;">
+      <span class="label"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M19 21l-7-5-7 5V5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2z"/></svg> Common foods (<span id="foodCount">0</span>)</span>
+      <span class="link" id="foodToggleLabel" style="pointer-events:none;">Show</span>
+    </button>
+    <div id="foodsBody" class="hide" style="margin-top:16px;">
+      <div class="searchbox">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
+        <input type="text" id="foodSearch" placeholder="Search saved foods..." />
+      </div>
+      <div id="foodListWrap"></div>
+    </div>
+  </div>
+
+  <p class="note">Saved on this device &middot; private to you</p>
+</div>
+
+<div id="modal" class="overlay hide">
+  <div class="sheet">
+    <p>Clear all meals logged today? Your goal, presets, and saved foods stay.</p>
+    <div class="row between">
+      <button class="ghost" id="modalCancel">Cancel</button>
+      <button class="btn" id="modalConfirm">Clear today</button>
+    </div>
+  </div>
+</div>
+
+<div id="servingModal" class="overlay hide">
+  <div class="sheet">
+    <p style="margin-bottom:6px;"><b id="svFoodName">Food</b></p>
+    <div class="sub" id="svPerServing" style="font-size:12px; margin-bottom:16px;"></div>
+    <label class="fieldlabel">Servings</label>
+    <input type="number" inputmode="decimal" id="svCount" value="1" style="margin-bottom:12px;" />
+    <div class="preview" style="margin-bottom:18px;">Total: <b id="svPreview">0</b> cal</div>
+    <div class="row between">
+      <button class="ghost" id="svCancel">Cancel</button>
+      <button class="btn" id="svConfirm"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>Add</button>
+    </div>
+  </div>
+</div>
+
+<script>
+(function(){
+  "use strict";
+  var DEF_P=150, DEF_C=200, DEF_F=65;
+
+  function num(v){ var n=parseFloat(v); return (isNaN(n)||n<0)?0:n; }
+  function calc(p,c,f){ return Math.round(p*4 + c*4 + f*9); }
+  function uid(){ return Math.random().toString(36).slice(2,10)+Date.now().toString(36).slice(-4); }
+  function fmt(n){ return Number(n).toLocaleString(); }
+  function round(n){ return Math.round(Number(n)||0); }
+  function trim2(n){ return Math.round((Number(n)||0)*100)/100; }
+  function servLabel(n){ var s=trim2(n); return (s===1?"1 serving":(s+" servings")); }
+  function todayStr(){ var d=new Date(); return d.getFullYear()+"-"+String(d.getMonth()+1).padStart(2,"0")+"-"+String(d.getDate()).padStart(2,"0"); }
+  function prettyDate(s){ var a=s.split("-").map(Number); var d=new Date(a[0],a[1]-1,a[2]); return d.toLocaleDateString(undefined,{weekday:"long",month:"long",day:"numeric"}); }
+  function anyMacro(x){ return (Number(x.p)||0)>0 || (Number(x.c)||0)>0 || (Number(x.f)||0)>0; }
+
+  // on-device store; the Scriptable side reads window.STORE and saves it
+  window.STORE = (typeof window.__INITIAL__ !== "undefined" && window.__INITIAL__) ? window.__INITIAL__ : {};
+  if(!window.STORE.days) window.STORE.days = {};
+  if(!window.STORE.presets) window.STORE.presets = [];
+  if(!window.STORE.foods) window.STORE.foods = [];
+  if(!window.STORE.settings) window.STORE.settings = {};
+
+  var TODAY = todayStr();
+  var state = { goalP:DEF_P, goalC:DEF_C, goalF:DEF_F, goalName:"", meals:[], presets:[], foods:[] };
+  var showFoods = false;
+  var pendingFood = null; // food awaiting a servings choice
+
+  function load(){
+    var S = window.STORE;
+    var day = S.days[TODAY];
+    var set = S.settings || {};
+    function pick(a,b,d){ return a!=null?a:(b!=null?b:d); }
+    state.goalP = pick(day&&day.goalP, set.lastGoalP, DEF_P);
+    state.goalC = pick(day&&day.goalC, set.lastGoalC, DEF_C);
+    state.goalF = pick(day&&day.goalF, set.lastGoalF, DEF_F);
+    state.goalName = (day&&day.goalName!=null) ? day.goalName : (set.lastGoalName||"");
+    state.meals = (day&&day.meals)?day.meals:[];
+    state.presets = S.presets||[];
+    state.foods = S.foods||[];
+  }
+  function persist(){
+    var S = window.STORE;
+    S.days[TODAY] = {goalP:state.goalP, goalC:state.goalC, goalF:state.goalF, goalName:state.goalName, meals:state.meals};
+    S.settings = {lastGoalP:state.goalP, lastGoalC:state.goalC, lastGoalF:state.goalF, lastGoalName:state.goalName};
+    S.presets = state.presets;
+    S.foods = state.foods;
+    // keep the store small: retain only the most recent 45 days
+    var keys = Object.keys(S.days).sort();
+    if(keys.length > 45){ keys.slice(0, keys.length-45).forEach(function(k){ delete S.days[k]; }); }
+    window.__rev = (window.__rev||0) + 1; // marks unsaved change for the saver
+  }
+
+  // If the clock has crossed midnight while the app is open, roll to the new day.
+  function maybeRollover(){
+    var t = todayStr();
+    if(t !== TODAY){
+      persist();          // save the day that just ended
+      TODAY = t;
+      load();             // fresh day: empty meals, goals carried from settings
+      var de = document.getElementById("date"); if(de) de.textContent = prettyDate(TODAY);
+    }
+  }
+
+  function $(id){ return document.getElementById(id); }
+  function pctOf(v,g){ return g>0?Math.min(100,(v/g)*100):0; }
+
+  var ICON_TRASH='<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6"/><path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/><line x1="10" y1="11" x2="10" y2="17"/><line x1="14" y1="11" x2="14" y2="17"/></svg>';
+  var ICON_X='<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>';
+  var ICON_PLUS='<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>';
+
+  function esc(s){ return String(s).replace(/[&<>"]/g,function(c){return {"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c];}); }
+
+  function render(){
+    maybeRollover();
+    var goalCal = calc(state.goalP, state.goalC, state.goalF);
+    var consumed = state.meals.reduce(function(s,m){return s+(Number(m.cal)||0);},0);
+    var tP = Math.round(state.meals.reduce(function(s,m){return s+(Number(m.p)||0);},0));
+    var tC = Math.round(state.meals.reduce(function(s,m){return s+(Number(m.c)||0);},0));
+    var tF = Math.round(state.meals.reduce(function(s,m){return s+(Number(m.f)||0);},0));
+    var remaining = goalCal - consumed;
+    var over = consumed > goalCal;
+
+    $("goalLabel").textContent = "Goal" + (state.goalName? ": "+state.goalName : "");
+    $("consumed").textContent = fmt(consumed);
+    $("goalCal").textContent = fmt(goalCal);
+    $("remaining").textContent = fmt(Math.abs(remaining));
+    $("remaining").style.color = over ? "var(--over)" : "var(--ink)";
+    $("remLabel").textContent = over ? "over goal" : "remaining";
+
+    var calBar = $("calBar");
+    calBar.className = "bar" + (over?" over":"");
+    calBar.firstElementChild.style.width = pctOf(consumed, goalCal) + "%";
+
+    // a macro counts as "hit" only when its goal is a real, positive target
+    var hitP = state.goalP>0 && tP>=state.goalP;
+    var hitC = state.goalC>0 && tC>=state.goalC;
+    var hitF = state.goalF>0 && tF>=state.goalF;
+    $("stP").textContent = tP; $("gpP").textContent = state.goalP; $("stP").style.color = hitP?"var(--good)":"var(--ink)";
+    $("stC").textContent = tC; $("gpC").textContent = state.goalC; $("stC").style.color = hitC?"var(--good)":"var(--ink)";
+    $("stF").textContent = tF; $("gpF").textContent = state.goalF; $("stF").style.color = hitF?"var(--good)":"var(--ink)";
+    setBar("barP", tP, state.goalP, hitP); setBar("barC", tC, state.goalC, hitC); setBar("barF", tF, state.goalF, hitF);
+
+    $("winBanner").className = (hitP && hitC && hitF) ? "winbanner" : "winbanner hide";
+
+    renderPresets(); renderMeals(); renderFoods();
+  }
+  function setBar(id, v, g, hit){
+    var el=$(id);
+    el.className = "mini" + (hit ? " good" : "");
+    el.firstElementChild.style.width = pctOf(v,g)+"%";
+  }
+
+  function renderPresets(){
+    var c=$("presetChips");
+    if(!state.presets.length){ c.className=""; c.innerHTML='<p class="faint" style="font-size:12px;margin:0;">No presets yet. Create one to reuse a full macro target.</p>'; return; }
+    var html="";
+    state.presets.forEach(function(p){
+      var cal = p.p!=null ? calc(p.p,p.c||0,p.f||0) : (p.cal||0);
+      var active = p.p!=null && state.goalP===p.p && state.goalC===(p.c||0) && state.goalF===(p.f||0) && state.goalName===p.name;
+      html += '<div class="chip'+(active?" active":"")+'" data-apply="'+p.id+'">'
+        + '<span style="font-weight:500;">'+esc(p.name)+'</span>'
+        + '<span class="cal">'+fmt(cal)+'</span>'
+        + '<button class="del" data-delpreset="'+p.id+'">'+ICON_X+'</button></div>';
+    });
+    c.className="chips"; c.innerHTML=html;
+  }
+
+  function macroLine(x){
+    return 'P '+round(x.p||0)+'g &middot; C '+round(x.c||0)+'g &middot; F '+round(x.f||0)+'g';
+  }
+
+  function renderMeals(){
+    $("mealCount").textContent = state.meals.length;
+    var ul=$("mealList");
+    if(!state.meals.length){ ul.innerHTML='<li style="border:none;"><span class="empty" style="width:100%;">No meals logged yet today. Add your first meal above.</span></li>'; return; }
+    var html="";
+    state.meals.forEach(function(m){
+      var parts=[];
+      if(m.servings!=null) parts.push(servLabel(m.servings));
+      if(anyMacro(m)) parts.push(macroLine(m));
+      var mac = parts.length ? '<div class="mmac">'+parts.join(" &middot; ")+'</div>' : '';
+      html += '<li><div><span class="mname">'+esc(m.name)+'</span>'+mac+'</div>'
+        + '<div class="row gap3"><span class="mcal">'+fmt(m.cal)+' cal</span>'
+        + '<button class="iconbtn" data-delmeal="'+m.id+'">'+ICON_TRASH+'</button></div></li>';
+    });
+    ul.innerHTML=html;
+  }
+
+  function renderFoods(){
+    $("foodCount").textContent = state.foods.length;
+    $("foodToggleLabel").textContent = showFoods ? "Hide" : "Show";
+    $("foodsBody").className = showFoods ? "" : "hide";
+    if(!showFoods) return;
+    var q = ($("foodSearch").value||"").toLowerCase();
+    var list = state.foods.filter(function(f){ return f.name.toLowerCase().indexOf(q)>=0; });
+    var wrap=$("foodListWrap");
+    if(!state.foods.length){ wrap.innerHTML='<p class="empty">No saved foods yet. Check "Save to my common foods" when adding a meal.</p>'; return; }
+    if(!list.length){ wrap.innerHTML='<p class="empty">No matches.</p>'; return; }
+    var html='<ul class="list scroll">';
+    list.forEach(function(f){
+      var detail = anyMacro(f)
+        ? (macroLine(f)+' &middot; '+fmt(calc(f.p||0,f.c||0,f.f||0))+' cal / serving')
+        : (fmt(f.cal||0)+' cal / serving');
+      html += '<li><div><span class="mname">'+esc(f.name)+'</span><div class="mmac">'+detail+'</div></div>'
+        + '<div class="row gap2"><button class="addbtnsmall" data-addfood="'+f.id+'">'+ICON_PLUS+'Add</button>'
+        + '<button class="iconbtn" data-delfood="'+f.id+'">'+ICON_TRASH+'</button></div></li>';
+    });
+    html+='</ul>';
+    wrap.innerHTML=html;
+  }
+
+  function updateMealPreview(){
+    var serv = num($("mServ").value); if(serv<=0) serv=1;
+    var sp=num($("mP").value), sc=num($("mC").value), sf=num($("mF").value);
+    var total = calc(sp*serv, sc*serv, sf*serv);
+    var per = calc(sp,sc,sf);
+    $("mealPreview").textContent = fmt(total);
+    $("mealBreakdown").textContent = (serv!==1 && per>0) ? (" · "+servLabel(serv)+" × "+fmt(per)+" cal") : "";
+  }
+
+  function addMeal(){
+    maybeRollover();
+    var serv = num($("mServ").value); if(serv<=0) serv=1;
+    var sp=num($("mP").value), sc=num($("mC").value), sf=num($("mF").value);
+    var name=$("mName").value.trim();
+    if(!name) return; // 0-calorie meals are allowed; only the name is required
+    var p=sp*serv, c=sc*serv, f=sf*serv, cal=calc(p,c,f);
+    state.meals.push({id:uid(), name:name, servings:serv, sp:sp, sc:sc, sf:sf, p:p, c:c, f:f, cal:cal});
+    if($("saveFood").checked && !state.foods.some(function(x){return x.name.toLowerCase()===name.toLowerCase();})){
+      // saved foods always store macros PER SERVING
+      state.foods.push({id:uid(), name:name, p:sp, c:sc, f:sf, cal:calc(sp,sc,sf)});
+      state.foods.sort(function(a,b){return a.name.localeCompare(b.name);});
+    }
+    persist();
+    $("mName").value=""; $("mServ").value="1"; $("mP").value=""; $("mC").value=""; $("mF").value=""; $("saveFood").checked=false;
+    $("mealPreview").textContent="0"; $("mealBreakdown").textContent="";
+    render();
+  }
+
+  // ---- adding a saved food: ask for servings first ----
+  function openServingPrompt(food){
+    pendingFood = food;
+    $("svFoodName").textContent = food.name;
+    var per = anyMacro(food) ? calc(food.p||0,food.c||0,food.f||0) : (food.cal||0);
+    $("svPerServing").textContent = (anyMacro(food) ? (macroLine(food)+' · ') : '') + fmt(per) + ' cal / serving';
+    $("svCount").value = "1";
+    updateServingPreview();
+    $("servingModal").className = "overlay";
+  }
+  function updateServingPreview(){
+    if(!pendingFood) return;
+    var serv = num($("svCount").value); if(serv<=0) serv=1;
+    var sp=pendingFood.p||0, sc=pendingFood.c||0, sf=pendingFood.f||0;
+    var cal = anyMacro(pendingFood) ? calc(sp*serv, sc*serv, sf*serv) : Math.round((pendingFood.cal||0)*serv);
+    $("svPreview").textContent = fmt(cal);
+  }
+  function confirmServing(){
+    if(!pendingFood) return;
+    maybeRollover();
+    var serv = num($("svCount").value); if(serv<=0) serv=1;
+    var sp=pendingFood.p||0, sc=pendingFood.c||0, sf=pendingFood.f||0;
+    var p=sp*serv, c=sc*serv, f=sf*serv;
+    var cal = anyMacro(pendingFood) ? calc(p,c,f) : Math.round((pendingFood.cal||0)*serv);
+    state.meals.push({id:uid(), name:pendingFood.name, servings:serv, sp:sp, sc:sc, sf:sf, p:p, c:c, f:f, cal:cal});
+    pendingFood = null;
+    $("servingModal").className = "overlay hide";
+    persist(); render();
+  }
+  function addFromSaved(id){
+    var f=null; state.foods.forEach(function(x){ if(x.id===id) f=x; }); if(!f) return;
+    openServingPrompt(f);
+  }
+
+  function addPreset(){
+    var p=num($("pP").value), c=num($("pC").value), f=num($("pF").value);
+    var name=$("pName").value.trim();
+    if(!name || calc(p,c,f)<=0) return;
+    state.presets.push({id:uid(), name:name, p:p, c:c, f:f});
+    persist();
+    $("pName").value=""; $("pP").value=""; $("pC").value=""; $("pF").value=""; $("presetPreview").textContent="0";
+    $("presetForm").className="hide";
+    render();
+  }
+  function applyPreset(id){
+    var p=null; state.presets.forEach(function(x){ if(x.id===id) p=x; }); if(!p||p.p==null) return;
+    state.goalP=p.p; state.goalC=p.c||0; state.goalF=p.f||0; state.goalName=p.name;
+    persist(); render();
+  }
+  function saveGoal(){
+    state.goalP=num($("gP").value); state.goalC=num($("gC").value); state.goalF=num($("gF").value);
+    state.goalName=$("gName").value.trim();
+    persist();
+    $("goalEdit").className="hide"; $("goalDisplay").classList.remove("hide"); $("editGoalBtn").classList.remove("hide");
+    render();
+  }
+
+  function init(){
+    $("date").textContent = prettyDate(TODAY);
+    load();
+    render();
+    persist();
+
+    $("addMealBtn").addEventListener("click", addMeal);
+    $("savePresetBtn").addEventListener("click", addPreset);
+    $("saveGoalBtn").addEventListener("click", saveGoal);
+
+    $("editGoalBtn").addEventListener("click", function(){
+      $("gName").value=state.goalName; $("gP").value=state.goalP; $("gC").value=state.goalC; $("gF").value=state.goalF;
+      $("goalPreview").textContent=fmt(calc(state.goalP,state.goalC,state.goalF));
+      $("goalEdit").classList.remove("hide"); $("goalDisplay").classList.add("hide"); $("editGoalBtn").classList.add("hide");
+    });
+    $("cancelGoalBtn").addEventListener("click", function(){
+      $("goalEdit").className="hide"; $("goalDisplay").classList.remove("hide"); $("editGoalBtn").classList.remove("hide");
+    });
+    $("newPresetBtn").addEventListener("click", function(){ $("presetForm").classList.toggle("hide"); });
+    $("toggleFoods").addEventListener("click", function(){ showFoods=!showFoods; renderFoods(); });
+    $("foodSearch").addEventListener("input", renderFoods);
+
+    // reset uses a custom confirm box (native confirm() does nothing in this web view)
+    $("resetBtn").addEventListener("click", function(){ $("modal").className="overlay"; });
+    $("modalCancel").addEventListener("click", function(){ $("modal").className="overlay hide"; });
+    $("modalConfirm").addEventListener("click", function(){
+      state.meals=[]; persist(); render(); $("modal").className="overlay hide";
+    });
+
+    // servings prompt for saved foods
+    $("svCount").addEventListener("input", updateServingPreview);
+    $("svCancel").addEventListener("click", function(){ pendingFood=null; $("servingModal").className="overlay hide"; });
+    $("svConfirm").addEventListener("click", confirmServing);
+
+    // live total preview for the add-meal form (servings-aware)
+    ["mServ","mP","mC","mF"].forEach(function(id){ $(id).addEventListener("input", updateMealPreview); });
+
+    function bindPreview(ids, target){
+      ids.forEach(function(id){ $(id).addEventListener("input", function(){
+        $(target).textContent = fmt(calc(num($(ids[0]).value), num($(ids[1]).value), num($(ids[2]).value)));
+      });});
+    }
+    bindPreview(["gP","gC","gF"], "goalPreview");
+    bindPreview(["pP","pC","pF"], "presetPreview");
+
+    document.body.addEventListener("click", function(e){
+      var t = e.target.closest ? e.target.closest("[data-delmeal],[data-delpreset],[data-apply],[data-addfood],[data-delfood]") : null;
+      if(!t) return;
+      if(t.hasAttribute("data-delmeal")){ var id=t.getAttribute("data-delmeal"); state.meals=state.meals.filter(function(m){return m.id!==id;}); persist(); render(); }
+      else if(t.hasAttribute("data-delpreset")){ e.stopPropagation(); var pid=t.getAttribute("data-delpreset"); state.presets=state.presets.filter(function(p){return p.id!==pid;}); persist(); render(); }
+      else if(t.hasAttribute("data-apply")){ applyPreset(t.getAttribute("data-apply")); }
+      else if(t.hasAttribute("data-addfood")){ addFromSaved(t.getAttribute("data-addfood")); }
+      else if(t.hasAttribute("data-delfood")){ var fid=t.getAttribute("data-delfood"); state.foods=state.foods.filter(function(f){return f.id!==fid;}); persist(); render(); }
+    });
+  }
+
+  if(document.readyState==="loading") document.addEventListener("DOMContentLoaded", init);
+  else init();
+})();
+</script>
+</body>
+</html>
+`;
+
+// ---- present the app; continuously snapshot data to a JSON file ----
+const wv = new WebView();
+await wv.loadHTML(html);
+
+function sleep(ms){ return new Promise(function(res){ Timer.schedule(ms, false, res); }); }
+
+function writeStore(s){
+  try { fm.writeString(STORE_PATH, s); }
+  catch(e){ console.log("Writing store failed: " + e); }
+}
+
+let stopped = false;
+let last = saved || "";
+
+async function saver(){
+  while(!stopped){
+    try{
+      const s = await wv.evaluateJavaScript("JSON.stringify(window.STORE)");
+      if(s && s !== "null" && s !== last){ last = s; writeStore(s); }
+    }catch(e){ console.log("Saver tick error: " + e); }
+    await sleep(800);
+  }
+}
+saver();
+
+await wv.present(true);
+stopped = true;
+
+// final save on close (reliable: the WebView object is still queryable after dismissal)
+try{
+  const fin = await wv.evaluateJavaScript("JSON.stringify(window.STORE)");
+  if(fin && fin !== "null"){ writeStore(fin); }
+}catch(e){ console.log("Final save error: " + e); }
